@@ -434,7 +434,7 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     let timeout = std::env::var("XCL_MEMORY_WAIT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
+        .unwrap_or(60);
     let start = std::time::Instant::now();
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
