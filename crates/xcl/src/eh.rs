@@ -148,7 +148,7 @@ pub fn install_crash_handler() {
         }
         SetUnhandledExceptionFilter(Some(unhandled_filter));
         install_invalid_parameter_handler();
-        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(cpp_exception_logger));
     }
 }
 
@@ -462,6 +462,24 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
     // `XCL_TRACE_FAULTS=1`: access violations as they are raised (the first 32), before the
     // title's handlers – a title whose own crash filter ends the process leaves no other trace
     if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
+        let op = rec.ExceptionInformation[0];
+        let addr = rec.ExceptionInformation[1];
+        if op == 1 && addr == 0 {
+            let rip = rec.ExceptionAddress as usize;
+            if code_bytes_at(rip, 11) >= 11 {
+                let code = std::slice::from_raw_parts(rip as *const u8, 11);
+                if code.starts_with(&[0xC7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]) {
+                    let imm = u32::from_le_bytes(code[7..11].try_into().unwrap());
+                    crate::xlog_warn!(
+                        "bypassed intentional crash trap (mov [0], {imm:#010x}) in {}",
+                        modules::describe_address(rip)
+                    );
+                    let ctx = &mut *(*info).ContextRecord;
+                    ctx.Rip += 11;
+                    return -1; // EXCEPTION_CONTINUE_EXECUTION
+                }
+            }
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static N: AtomicUsize = AtomicUsize::new(0);
         if *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FAULTS").is_some()) && N.fetch_add(1, Ordering::Relaxed) < 32 {
@@ -1149,6 +1167,39 @@ mod tests {
             modules::unregister_mapped(code);
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn intentional_null_write_trap_is_stepped_over() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_RECORD, EXCEPTION_POINTERS};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        unsafe {
+            let code_mem = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
+            assert!(code_mem != 0);
+            // mov dword ptr [0], 0x4D8BD421
+            let trap_bytes = [0xC7u8, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x21, 0xD4, 0x8B, 0x4D];
+            std::ptr::copy_nonoverlapping(trap_bytes.as_ptr(), code_mem as *mut u8, 11);
+
+            let mut rec: EXCEPTION_RECORD = std::mem::zeroed();
+            rec.ExceptionCode = 0xC000_0005_u32 as i32;
+            rec.ExceptionAddress = code_mem as *mut _;
+            rec.NumberParameters = 2;
+            rec.ExceptionInformation[0] = 1; // write
+            rec.ExceptionInformation[1] = 0; // address 0
+
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = code_mem as u64;
+
+            let mut ep: EXCEPTION_POINTERS = std::mem::zeroed();
+            ep.ExceptionRecord = &mut rec;
+            ep.ContextRecord = &mut ctx;
+
+            let res = cpp_exception_logger(&mut ep);
+            assert_eq!(res, -1); // EXCEPTION_CONTINUE_EXECUTION
+            assert_eq!(ctx.Rip, (code_mem + 11) as u64);
+
+            VirtualFree(code_mem as *mut _, 0, MEM_RELEASE);
         }
     }
 }
