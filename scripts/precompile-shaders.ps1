@@ -36,12 +36,19 @@ $GamePath = if ($Game) { $Game } elseif ($env:GAME_PATH) { $env:GAME_PATH } else
     exit 1
 }
 
+$Target = if (Test-Path (Join-Path $GamePath "shaders.rpf")) {
+    Join-Path $GamePath "shaders.rpf"
+} else {
+    $GamePath
+}
+
 $XclExe = Join-Path $RepoRoot "target\release\xcl.exe"
 
 Write-Host "Precompiling shaders for game..." -ForegroundColor Cyan
 Write-Host "Game: $GamePath" -ForegroundColor White
+Write-Host "Target: $Target" -ForegroundColor White
 if ($env:XCL_DXC_DIR) {
     Write-Host "DXC:  $env:XCL_DXC_DIR" -ForegroundColor Green
 }
 
-& $XclExe shaders $GamePath --precompile --pipelines $ExtraArgs
+& $XclExe shaders $Target --precompile --pipelines $ExtraArgs

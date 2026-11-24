@@ -738,6 +738,11 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
         if name.ends_with(".txt") || name.contains(".fssm") {
             continue;
         }
+        // Shaders are never multi-gigabyte archives. Skip any file > 64 MB
+        // to avoid Out-Of-Memory when traversing game folders.
+        if p.metadata().is_ok_and(|m| m.len() > 64 * 1024 * 1024) {
+            continue;
+        }
         out.push(p);
     }
 }
@@ -831,10 +836,31 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let t0 = std::time::Instant::now();
 
     let (input, what) = if path.is_dir() {
-        let mut files = Vec::new();
-        collect_files(path, &mut files);
-        let n = files.len();
-        (Input::Files(files), format!("folder, {n} files"))
+        let shaders_pack = path.join("shaders.rpf");
+        if shaders_pack.is_file() {
+            let data = match std::fs::read(&shaders_pack) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("xcl shaders: {}: {e}", shaders_pack.display());
+                    return 2;
+                }
+            };
+            if data.starts_with(pack::RPF9_MAGIC) {
+                let records = pack::scan(&data, 0x40);
+                let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
+                (Input::Pack { data, records }, what)
+            } else {
+                let mut files = Vec::new();
+                collect_files(path, &mut files);
+                let n = files.len();
+                (Input::Files(files), format!("folder, {n} files"))
+            }
+        } else {
+            let mut files = Vec::new();
+            collect_files(path, &mut files);
+            let n = files.len();
+            (Input::Files(files), format!("folder, {n} files"))
+        }
     } else {
         let data = match std::fs::read(path) {
             Ok(d) => d,
