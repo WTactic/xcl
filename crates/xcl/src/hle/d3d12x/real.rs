@@ -4505,7 +4505,7 @@ unsafe fn go_background(
             0
         }
     });
-    if super::pso_async::lazy() {
+    if super::pso_async::lazy() && !compute {
         super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
