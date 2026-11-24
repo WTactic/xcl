@@ -459,6 +459,18 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
     if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
         return emulate_console_only(&mut *(*info).ContextRecord);
     }
+    if rec.ExceptionCode as u32 == 0x8000_0003 {
+        let rip = rec.ExceptionAddress as usize;
+        if modules::image_base_for_addr(rip).is_some() && code_bytes_at(rip, 1) >= 1 {
+            let code = std::slice::from_raw_parts(rip as *const u8, 1);
+            if code[0] == 0xCC {
+                crate::xlog_warn!("bypassed int 3 trap in {}", modules::describe_address(rip));
+                let ctx = &mut *(*info).ContextRecord;
+                ctx.Rip += 1;
+                return -1; // EXCEPTION_CONTINUE_EXECUTION
+            }
+        }
+    }
     // `XCL_TRACE_FAULTS=1`: access violations as they are raised (the first 32), before the
     // title's handlers – a title whose own crash filter ends the process leaves no other trace
     if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
@@ -466,16 +478,23 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
         let addr = rec.ExceptionInformation[1];
         if op == 1 && addr == 0 {
             let rip = rec.ExceptionAddress as usize;
-            if code_bytes_at(rip, 11) >= 11 {
-                let code = std::slice::from_raw_parts(rip as *const u8, 11);
+            let n = code_bytes_at(rip, 14);
+            if n >= 11 {
+                let code = std::slice::from_raw_parts(rip as *const u8, n);
                 if code.starts_with(&[0xC7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]) {
                     let imm = u32::from_le_bytes(code[7..11].try_into().unwrap());
+                    let mut step = 11;
+                    if n >= 14 && &code[11..14] == &[0x31, 0xC0, 0xCC] {
+                        step = 14;
+                    } else if n >= 12 && code[11] == 0xCC {
+                        step = 12;
+                    }
                     crate::xlog_warn!(
-                        "bypassed intentional crash trap (mov [0], {imm:#010x}) in {}",
+                        "bypassed intentional crash trap (mov [0], {imm:#010x}, step {step}) in {}",
                         modules::describe_address(rip)
                     );
                     let ctx = &mut *(*info).ContextRecord;
-                    ctx.Rip += 11;
+                    ctx.Rip += step as u64;
                     return -1; // EXCEPTION_CONTINUE_EXECUTION
                 }
             }
@@ -1172,12 +1191,19 @@ mod tests {
 
     #[test]
     fn intentional_null_write_trap_is_stepped_over() {
+        use std::sync::{atomic::AtomicBool, Arc};
         use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_RECORD, EXCEPTION_POINTERS};
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
         unsafe {
             let code_mem = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
             assert!(code_mem != 0);
-            // mov dword ptr [0], 0x4D8BD421
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: "trap_test.exe".into(), path: "trap_test.exe".into(), base: code_mem, size: 0x1000, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true), stack_reserve: 0,
+            }));
+
+            // Test 1: mov dword ptr [0], 0x4D8BD421 (11 bytes)
             let trap_bytes = [0xC7u8, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x21, 0xD4, 0x8B, 0x4D];
             std::ptr::copy_nonoverlapping(trap_bytes.as_ptr(), code_mem as *mut u8, 11);
 
@@ -1196,9 +1222,31 @@ mod tests {
             ep.ContextRecord = &mut ctx;
 
             let res = cpp_exception_logger(&mut ep);
-            assert_eq!(res, -1); // EXCEPTION_CONTINUE_EXECUTION
+            assert_eq!(res, -1);
             assert_eq!(ctx.Rip, (code_mem + 11) as u64);
 
+            // Test 2: mov dword ptr [0], 0 followed by int 3 (12 bytes)
+            let trap_int3 = [0xC7u8, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xCC];
+            std::ptr::copy_nonoverlapping(trap_int3.as_ptr(), (code_mem + 0x100) as *mut u8, 12);
+            rec.ExceptionAddress = (code_mem + 0x100) as *mut _;
+            ctx.Rip = (code_mem + 0x100) as u64;
+            ep.ExceptionRecord = &mut rec;
+            let res = cpp_exception_logger(&mut ep);
+            assert_eq!(res, -1);
+            assert_eq!(ctx.Rip, (code_mem + 0x100 + 12) as u64);
+
+            // Test 3: standalone int 3 (0x80000003)
+            let int3_byte = [0xCCu8];
+            std::ptr::copy_nonoverlapping(int3_byte.as_ptr(), (code_mem + 0x200) as *mut u8, 1);
+            rec.ExceptionCode = 0x8000_0003_u32 as i32;
+            rec.ExceptionAddress = (code_mem + 0x200) as *mut _;
+            ctx.Rip = (code_mem + 0x200) as u64;
+            ep.ExceptionRecord = &mut rec;
+            let res = cpp_exception_logger(&mut ep);
+            assert_eq!(res, -1);
+            assert_eq!(ctx.Rip, (code_mem + 0x200 + 1) as u64);
+
+            modules::unregister_mapped(code_mem);
             VirtualFree(code_mem as *mut _, 0, MEM_RELEASE);
         }
     }
